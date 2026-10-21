@@ -3,9 +3,6 @@
 Native Win32 image viewer with Windows XP Luna chrome: custom caption, minimize / maximize / close buttons, and an Explorer folder picker.
 
 A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/releases/latest/download/Photo.Viewer.exe) on the [latest release](https://github.com/oiuy-retro/photo-viewer/releases/latest). It is a single file. Windows Imaging Component does the decode.
-```
-sha256: 42029ac027bf108f9b52206c8cc9be86a67366b8e14f1a26623c7b0bfd943345
-```
 
 ## What it does
 
