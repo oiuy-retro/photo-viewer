@@ -5,3 +5,5 @@ RESUME.md
 *.log
 .idea/
 .vscode/
+dist/
+*.exe

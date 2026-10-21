@@ -2,7 +2,7 @@
 
 Native Win32 image viewer with Windows XP Luna chrome: custom caption, minimize / maximize / close buttons, and an Explorer folder picker.
 
-A built copy is in [`dist/Photo Viewer.exe`](dist/Photo%20Viewer.exe). It is a single file. Windows Imaging Component does the decode.
+A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/releases/latest/download/Photo.Viewer.exe) on the [latest release](https://github.com/oiuy-retro/photo-viewer/releases/latest). It is a single file. Windows Imaging Component does the decode.
 ```
 sha256: 42029ac027bf108f9b52206c8cc9be86a67366b8e14f1a26623c7b0bfd943345
 ```
@@ -23,7 +23,7 @@ Maximize fills the monitor work area. The rounded window region is cleared while
 
 ## Run
 
-Start `dist/Photo Viewer.exe`. Windows 10 or later. No extra files.
+Start `Photo Viewer.exe`. Windows 10 or later. No extra files.
 
 ## Build
 
