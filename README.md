@@ -3,25 +3,8 @@
 Native Win32 image viewer with Windows XP Luna chrome: custom caption, minimize / maximize / close buttons, and an Explorer folder picker.
 
 A built copy is in [`dist/Photo Viewer.exe`](dist/Photo%20Viewer.exe). It is a single file. Windows Imaging Component does the decode.
-
-## Verify the download
-
-SHA-256 of [`dist/Photo Viewer.exe`](dist/Photo%20Viewer.exe):
-
-```text
-42029ac027bf108f9b52206c8cc9be86a67366b8e14f1a26623c7b0bfd943345
 ```
-
-The same hash is in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt). To check a copy on Windows, run this in PowerShell from the repository folder and compare the hash:
-
-```powershell
-Get-FileHash ".\dist\Photo Viewer.exe" -Algorithm SHA256
-```
-
-Or, from Command Prompt:
-
-```bat
-certutil -hashfile "dist\Photo Viewer.exe" SHA256
+sha256: 42029ac027bf108f9b52206c8cc9be86a67366b8e14f1a26623c7b0bfd943345
 ```
 
 ## What it does
