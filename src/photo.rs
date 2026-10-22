@@ -9,7 +9,8 @@ use std::thread::JoinHandle;
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICImagingFactory,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICBitmapSource,
+    IWICImagingFactory,
     IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal,
     WICBitmapTransformFlipVertical, WICBitmapTransformOptions, WICBitmapTransformRotate180,
     WICBitmapTransformRotate270, WICBitmapTransformRotate90, WICDecodeMetadataCacheOnDemand,
@@ -47,6 +48,18 @@ const EXT: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico", "heic",
     "heif", "wdp", "jxr", "hdp", "avif",
 ];
+
+/// Camera RAW formats. Windows opens these only when a RAW codec is installed
+/// (the free Microsoft "Raw Image Extension" on Windows 10/11, or a camera
+/// maker's WIC codec).
+const RAW_EXT: &[&str] = &[
+    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "orf", "rw2", "raf", "pef",
+    "ptx", "srw", "x3f", "3fr", "fff", "iiq", "mef", "mos", "mrw", "erf", "kdc", "dcr", "rwl",
+    "raw", "gpr",
+];
+
+/// WINCODEC_ERR_COMPONENTNOTFOUND: no WIC decoder is installed for the file.
+const NO_CODEC: windows::core::HRESULT = windows::core::HRESULT(0x88982F50u32 as i32);
 
 const PROP_KEYS: &[(&str, PROPERTYKEY)] = &[
     ("Type", PKEY_ItemTypeText),
@@ -430,7 +443,14 @@ fn scan_names(folder: &Path) -> HashSet<String> {
 fn is_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| EXT.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        .map(|e| EXT.iter().chain(RAW_EXT).any(|x| e.eq_ignore_ascii_case(x)))
+        .unwrap_or(false)
+}
+
+fn is_raw(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RAW_EXT.iter().any(|x| e.eq_ignore_ascii_case(x)))
         .unwrap_or(false)
 }
 
@@ -506,27 +526,43 @@ pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
         let wide = path_wide(path);
         let decoder = factory
             .CreateDecoderFromFilename(PCWSTR(wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| open_error(path, &e))?;
         let frame = decoder.GetFrame(0).map_err(|e| e.to_string())?;
-        let converter = factory.CreateFormatConverter().map_err(|e| e.to_string())?;
-        converter
-            .Initialize(
-                &frame,
-                &GUID_WICPixelFormat32bppBGRA,
-                WICBitmapDitherTypeNone,
-                None::<&IWICPalette>,
-                0.0,
-                WICBitmapPaletteTypeCustom,
-            )
-            .map_err(|e| e.to_string())?;
-
         let orient = orientation(&frame);
-        let (width, height, bgra) = if let Some(options) = orient_options(orient) {
-            let rotator = factory.CreateBitmapFlipRotator().map_err(|e| e.to_string())?;
-            rotator.Initialize(&converter, options).map_err(|e| e.to_string())?;
-            copy_bgra(&rotator)?
-        } else {
-            copy_bgra(&converter)?
+
+        // Full decode first. RAW codecs can fail here (or while copying the
+        // pixels) on files they only partly understand, so fall back to the
+        // full-size JPEG preview most cameras embed, then to the thumbnail.
+        let mut preview = false;
+        let source: IWICBitmapSource = frame.cast().map_err(|e| e.to_string())?;
+        let (width, height, bgra) = match to_bgra(&factory, &source, orient) {
+            Ok(px) => px,
+            Err(full_err) => {
+                let fallbacks = [
+                    decoder.GetPreview().ok(),
+                    frame.GetThumbnail().ok(),
+                    decoder.GetThumbnail().ok(),
+                ];
+                let mut found = None;
+                for small in fallbacks.into_iter().flatten() {
+                    if let Ok(px) = to_bgra(&factory, &small, orient) {
+                        found = Some(px);
+                        break;
+                    }
+                }
+                match found {
+                    Some(px) => {
+                        preview = true;
+                        px
+                    }
+                    None if is_raw(path) => {
+                        return Err(format!(
+                            "Windows could not decode this RAW file ({full_err}). Updating the Raw Image Extension from the Microsoft Store may help."
+                        ))
+                    }
+                    None => return Err(full_err),
+                }
+            }
         };
 
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -534,8 +570,51 @@ pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
             ("Dimensions".into(), format!("{} × {}", width, height)),
             ("Size".into(), format_bytes(file_size)),
         ];
+        if preview {
+            props.push(("Shown".into(), "Embedded preview (full RAW decode failed)".into()));
+        }
         read_store(path, &mut props);
         Ok(Decoded { width, height, bgra, props })
+    }
+}
+
+/// Plain-language message when Windows cannot open a file at all.
+fn open_error(path: &Path, err: &windows::core::Error) -> String {
+    if err.code() != NO_CODEC {
+        return err.to_string();
+    }
+    if is_raw(path) {
+        "Windows has no RAW codec for this camera file. Install the free \"Raw Image Extension\" from the Microsoft Store, then reopen the folder.".into()
+    } else {
+        "Windows has no decoder for this picture type.".into()
+    }
+}
+
+/// Convert any WIC source to 32bpp BGRA, apply the EXIF orientation and copy the pixels out.
+fn to_bgra(
+    factory: &IWICImagingFactory,
+    source: &IWICBitmapSource,
+    orient: u16,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    unsafe {
+        let converter = factory.CreateFormatConverter().map_err(|e| e.to_string())?;
+        converter
+            .Initialize(
+                source,
+                &GUID_WICPixelFormat32bppBGRA,
+                WICBitmapDitherTypeNone,
+                None::<&IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .map_err(|e| e.to_string())?;
+        if let Some(options) = orient_options(orient) {
+            let rotator = factory.CreateBitmapFlipRotator().map_err(|e| e.to_string())?;
+            rotator.Initialize(&converter, options).map_err(|e| e.to_string())?;
+            copy_bgra(&rotator)
+        } else {
+            copy_bgra(&converter)
+        }
     }
 }
 
@@ -638,6 +717,16 @@ fn pwstr(ptr: PWSTR) -> String {
 mod tests {
     use super::*;
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+
+    #[test]
+    fn lists_raw_files() {
+        for name in ["a.CR2", "b.nef", "c.ARW", "d.dng", "e.cr3", "f.RAF"] {
+            assert!(is_image(Path::new(name)), "{name} should be listed");
+            assert!(is_raw(Path::new(name)));
+        }
+        assert!(!is_raw(Path::new("g.jpg")));
+        assert!(!is_image(Path::new("h.txt")));
+    }
 
     #[test]
     fn scans_and_decodes_jpeg() {
