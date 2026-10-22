@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, GetSystemMetrics, IsZoomed, LoadCursorW, LoadImageW, PostQuitMessage,
     RegisterClassW, SendMessageW, SetCursor, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_DROPSHADOW,
     CS_HREDRAW, CS_VREDRAW, DI_NORMAL, HMENU, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, IMAGE_ICON,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IMAGE_ICON,
     MINMAXINFO, MSG, NCCALCSIZE_PARAMS, SM_CXFRAME, SM_CXPADDEDBORDER, SM_CYFRAME, SW_MAXIMIZE,
     SW_MINIMIZE, SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CLOSE,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK,
@@ -978,18 +978,11 @@ impl App {
     }
 
     fn set_cursor(&self) -> Action {
+        // Plain arrow everywhere in the client area, including over the picture
+        // and while click-dragging to pan. The old four-way "move" cursor was
+        // distracting whenever the picture was zoomed.
         unsafe {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let _ = ScreenToClient(self.hwnd, &mut pt);
-            let over_image = luna::hit(self.layout().well_inner, pt);
-            let cursor = if (self.dragging || (self.view.zoomed() && over_image)) && self.lib.current_decoded().is_some()
-            {
-                LoadCursorW(None, IDC_SIZEALL)
-            } else {
-                LoadCursorW(None, IDC_ARROW)
-            };
-            if let Ok(c) = cursor {
+            if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
                 SetCursor(c);
             }
         }
