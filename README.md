@@ -16,6 +16,8 @@ A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/
 
 Formats are whatever WIC on that machine can open: JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, HEIC/HEIF (if the codecs are installed), JPEG XR, AVIF, and similar.
 
+Camera RAW files (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, SRW and others) are listed too. Windows needs a RAW codec to open them: install the free [Raw Image Extension](https://apps.microsoft.com/detail/9NCTDW2W1BH8) from the Microsoft Store. If the full RAW decode fails, the viewer shows the JPEG preview embedded in the file instead.
+
 Maximize fills the monitor work area. The rounded window region is cleared while maximized.
 
 ## Run
