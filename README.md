@@ -7,7 +7,7 @@ A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/
 ## What it does
 
 - **Start:** pick an input folder (pictures, name order via `StrCmpLogicalW`) and an output folder, then Open.
-- **View:** fit-to-height by default. Mouse wheel zooms in from fit. Double-click toggles 100% and fit. Click-drag pans when zoomed. Arrow keys change picture when unzoomed, pan when zoomed.
+- **View:** fit-to-height by default; pictures shorter than the window show at their real size (100%) instead of being enlarged. Mouse wheel zooms in from fit. Double-click toggles 100% and fit. Click-drag pans when zoomed. Arrow keys change picture when unzoomed, pan when zoomed.
 - Space copies the current file to the output folder (skips if it is already there).
 - Delete sends the file to the Recycle Bin.
 - Thin name bar with the filename and a Folders button. Esc or Folders returns to Start without unloading the browsed paths.
