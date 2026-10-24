@@ -10,6 +10,7 @@ A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/
 - **View:** fit-to-height by default. Mouse wheel zooms in from fit. Double-click toggles 100% and fit. Click-drag pans when zoomed. Arrow keys change picture when unzoomed, pan when zoomed.
 - Space copies the current file to the output folder (skips if it is already there).
 - Delete sends the file to the Recycle Bin.
+- Wide pictures that do not fit across the window at fit height can be zoomed out further with the mouse wheel, down to fit width.
 - Thin name bar with the filename and a Folders button. Esc or Folders returns to Start without unloading the browsed paths.
 - EXIF / property pane (camera, dates, GPS, and the rest that WIC exposes).
 - Decoded BGRA stays in RAM around the current index; the whole folder if it fits. Decode uses a few worker threads.
