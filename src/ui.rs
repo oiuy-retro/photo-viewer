@@ -288,8 +288,14 @@ fn create_window(instance: HINSTANCE) -> HWND {
     }
 }
 
+/// DPI of the monitor the window is on. The app is per-monitor DPI aware, so
+/// `GetDeviceCaps(LOGPIXELSX)` would only return the main screen's DPI.
 fn screen_dpi(hwnd: HWND) -> i32 {
     unsafe {
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as i32;
+        if dpi > 0 {
+            return dpi;
+        }
         let dc = GetDC(hwnd);
         let dpi = GetDeviceCaps(dc, LOGPIXELSX);
         let _ = ReleaseDC(hwnd, dc);
@@ -545,7 +551,9 @@ impl App {
                 Action::None
             }
             x if x == WM_DPICHANGED => {
-                self.sync_dpi();
+                // The new DPI is in the low word of wparam; lparam is the
+                // window rect Windows suggests for the new monitor.
+                self.set_dpi((wparam.0 & 0xFFFF) as i32);
                 let rect = unsafe { &*(lparam.0 as *const RECT) };
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
@@ -820,11 +828,27 @@ impl App {
     }
 
     fn sync_dpi(&mut self) {
-        let dpi = screen_dpi(self.hwnd);
-        if dpi != self.dpi && dpi > 0 {
-            self.fonts.drop_all();
-            self.dpi = dpi;
-            self.fonts = Fonts::new(dpi);
+        self.set_dpi(screen_dpi(self.hwnd));
+    }
+
+    /// Re-create the fonts and caption icon for a new DPI. Layout, the window
+    /// region and the back buffer are sized from `self.dpi` on the next paint.
+    fn set_dpi(&mut self, dpi: i32) {
+        if dpi <= 0 || dpi == self.dpi {
+            return;
+        }
+        self.fonts.drop_all();
+        self.dpi = dpi;
+        self.fonts = Fonts::new(dpi);
+        unsafe {
+            let module = GetModuleHandleW(None).unwrap_or_default();
+            let icon = load_icon(HINSTANCE(module.0), scale(16, dpi));
+            if !icon.0.is_null() {
+                if !self.icon.0.is_null() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(self.icon);
+                }
+                self.icon = icon;
+            }
         }
     }
 
