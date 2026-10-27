@@ -1140,9 +1140,11 @@ impl App {
         }
     }
 
+    /// Fit-height scale, but never above 100%: a picture shorter than the
+    /// window is shown at its real size instead of being blown up.
     fn fit_scale(&self, img: &Decoded, well: RECT) -> f64 {
         let vh = (well.bottom - well.top).max(1) as f64;
-        vh / img.height.max(1) as f64
+        (vh / img.height.max(1) as f64).min(1.0)
     }
 
     fn wheel(&mut self, wparam: WPARAM, lparam: LPARAM) -> Action {
@@ -1183,7 +1185,7 @@ impl App {
             self.view = View::Free {
                 scale: fit,
                 ox: (vw - dw) / 2.0,
-                oy: 0.0,
+                oy: (vh - img.height as f64 * fit) / 2.0,
             };
         }
         let factor = if delta > 0 { 1.2_f64 } else { 1.0 / 1.2 };
@@ -1206,7 +1208,6 @@ impl App {
                 *oy = cy - img_y * *scale;
             }
         }
-        let _ = vh;
         self.clamp_view();
         self.redraw();
         Action::None
@@ -1345,9 +1346,10 @@ impl App {
         let vh = (well.bottom - well.top).max(1) as f64;
         let (scale, ox, oy) = match self.view {
             View::FitHeight => {
-                let scale = vh / img.height.max(1) as f64;
+                let scale = self.fit_scale(img, well);
                 let dw = img.width as f64 * scale;
-                (scale, (vw - dw) / 2.0, 0.0)
+                let dh = img.height as f64 * scale;
+                (scale, (vw - dw) / 2.0, (vh - dh) / 2.0)
             }
             View::Free { scale, ox, oy } => (scale, ox, oy),
         };
@@ -1541,7 +1543,7 @@ impl App {
         if let Some(img) = self.lib.current_decoded() {
             let l = self.layout();
             let (_, _, _, _, scale) = self.dest_rect(&img, l.well_inner);
-            let mode = if !self.view.zoomed() {
+            let mode = if !self.view.zoomed() && (scale - 1.0).abs() >= 0.01 {
                 "Fit height".to_string()
             } else if (scale - 1.0).abs() < 0.01 {
                 "100%".to_string()
