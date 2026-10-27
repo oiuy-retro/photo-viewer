@@ -257,7 +257,7 @@ impl Library {
     }
 
     pub fn is_copied(&self) -> bool {
-        self.current_photo().map(|p| self.copied.contains(&p.name)).unwrap_or(false)
+        self.current_photo().map(|p| self.copied.contains(&name_key(&p.name))).unwrap_or(false)
     }
 
     pub fn ram_count(&self) -> usize {
@@ -388,11 +388,11 @@ impl Library {
         }
         let dest = output.join(&photo.name);
         if dest == photo.path {
-            self.copied.insert(photo.name.clone());
+            self.copied.insert(name_key(&photo.name));
             return Ok("Already in the output folder.");
         }
         if dest.exists() {
-            self.copied.insert(photo.name.clone());
+            self.copied.insert(name_key(&photo.name));
             return Ok("Already in the output folder.");
         }
         let src = path_wide(&photo.path);
@@ -400,7 +400,7 @@ impl Library {
         unsafe {
             CopyFileW(PCWSTR(src.as_ptr()), PCWSTR(dst.as_ptr()), true).map_err(|e| e.to_string())?;
         }
-        self.copied.insert(photo.name.clone());
+        self.copied.insert(name_key(&photo.name));
         Ok("Copied.")
     }
 }
@@ -434,7 +434,7 @@ fn scan_names(folder: &Path) -> HashSet<String> {
     };
     for entry in entries.flatten() {
         if entry.path().is_file() {
-            names.insert(entry.file_name().to_string_lossy().into_owned());
+            names.insert(name_key(&entry.file_name().to_string_lossy()));
         }
     }
     names
@@ -495,6 +495,12 @@ pub fn format_bytes(n: u64) -> String {
     } else {
         format!("{:.2} GB", n as f64 / GB)
     }
+}
+
+/// Windows file names ignore upper/lower case, so `IMG_1.JPG` and `img_1.jpg`
+/// are the same file. The "Copied" marker compares names in this form.
+fn name_key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 fn path_wide(path: &Path) -> Vec<u16> {
@@ -744,5 +750,11 @@ mod tests {
         unsafe {
             CoUninitialize();
         }
+    }
+
+    #[test]
+    fn copied_names_ignore_case() {
+        assert_eq!(name_key("IMG_0001.JPG"), name_key("img_0001.jpg"));
+        assert_ne!(name_key("a.jpg"), name_key("b.jpg"));
     }
 }
