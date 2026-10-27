@@ -1032,7 +1032,7 @@ impl App {
         self.last_mouse = p;
         match self.press {
             Hot::Caption => return Action::DragCaption,
-            Hot::Image if self.view.zoomed() && self.lib.current_decoded().is_some() => {
+            Hot::Image if self.pannable() => {
                 self.dragging = true;
                 unsafe {
                     let _ = SetCapture(self.hwnd);
@@ -1148,7 +1148,10 @@ impl App {
         let vw = (l.well_inner.right - l.well_inner.left).max(1) as f64;
         let vh = (l.well_inner.bottom - l.well_inner.top).max(1) as f64;
         let fit = self.fit_scale(&img, l.well_inner);
-        if delta <= 0 && !self.view.zoomed() {
+        let min = self.min_scale(&img, l.well_inner);
+        // At fit height, zooming out only goes further for pictures wider
+        // than the window (down to fit width).
+        if delta <= 0 && !self.view.zoomed() && min >= fit - 0.0005 {
             return Action::None;
         }
         if matches!(self.view, View::FitHeight) {
@@ -1165,8 +1168,13 @@ impl App {
             let cy = pt.y as f64 - l.well_inner.top as f64;
             let img_x = (cx - *ox) / *scale;
             let img_y = (cy - *oy) / *scale;
-            let next = (*scale * factor).min(16.0);
-            if next <= fit + 0.0005 {
+            let next = (*scale * factor).min(16.0_f64.max(fit)).max(min);
+            // Stop at fit height when a zoom step reaches or passes it, in
+            // either direction.
+            let eps = 0.0005;
+            let lands = (next - fit).abs() <= eps;
+            let crosses = (*scale > fit + eps && next < fit - eps) || (*scale < fit - eps && next > fit + eps);
+            if lands || crosses || (next <= fit + eps && min >= fit - eps) {
                 self.view = View::FitHeight;
             } else {
                 *scale = next;
@@ -1198,7 +1206,7 @@ impl App {
         }
         match vk {
             x if x == VK_LEFT.0 || x == VK_RIGHT.0 || x == VK_UP.0 || x == VK_DOWN.0 => {
-                if self.view.zoomed() {
+                if self.pannable() {
                     let l = self.layout();
                     let vw = (l.well_inner.right - l.well_inner.left).max(1) as f64;
                     let vh = (l.well_inner.bottom - l.well_inner.top).max(1) as f64;
@@ -1258,14 +1266,17 @@ impl App {
         let vw = (l.well_inner.right - l.well_inner.left).max(1) as f64;
         let vh = (l.well_inner.bottom - l.well_inner.top).max(1) as f64;
         let fit = self.fit_scale(&img, l.well_inner);
+        let min = self.min_scale(&img, l.well_inner);
         if let View::Free { scale, .. } = self.view {
-            if scale <= fit + 0.0005 {
+            // Back to fit height when at it, or when below it but the picture
+            // is not wider than the window (so there is nothing to zoom out to).
+            if scale <= fit + 0.0005 && (scale >= fit - 0.0005 || min >= fit - 0.0005) {
                 self.view = View::FitHeight;
                 return;
             }
         }
         if let View::Free { scale, ox, oy } = &mut self.view {
-            *scale = scale.max(fit);
+            *scale = scale.max(min);
             let dw = img.width as f64 * *scale;
             let dh = img.height as f64 * *scale;
             if dw <= vw {
@@ -1279,6 +1290,30 @@ impl App {
                 *oy = oy.clamp(vh - dh, 0.0);
             }
         }
+    }
+
+    /// Smallest zoom: fit height, or fit width when the picture is wider than
+    /// the window at fit height.
+    fn min_scale(&self, img: &Decoded, well: RECT) -> f64 {
+        let vw = (well.right - well.left).max(1) as f64;
+        let fit_width = vw / img.width.max(1) as f64;
+        self.fit_scale(img, well).min(fit_width)
+    }
+
+    /// True when the zoomed picture is bigger than the window in some
+    /// direction, so dragging and the arrow keys move it around. When the whole
+    /// picture is visible the arrow keys change picture instead.
+    fn pannable(&self) -> bool {
+        let View::Free { scale, .. } = self.view else {
+            return false;
+        };
+        let Some(img) = self.lib.current_decoded() else {
+            return false;
+        };
+        let l = self.layout();
+        let vw = (l.well_inner.right - l.well_inner.left).max(1) as f64;
+        let vh = (l.well_inner.bottom - l.well_inner.top).max(1) as f64;
+        img.width as f64 * scale > vw + 0.5 || img.height as f64 * scale > vh + 0.5
     }
 
     fn dest_rect(&self, img: &Decoded, well: RECT) -> (i32, i32, i32, i32, f64) {
