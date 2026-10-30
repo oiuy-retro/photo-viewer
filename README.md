@@ -25,6 +25,19 @@ Maximize fills the monitor work area. The rounded window region is cleared while
 
 Start `Photo Viewer.exe`. Windows 10 or later. No extra files.
 
+## Open pictures from Explorer
+
+`Photo Viewer.exe "C:\Photos\IMG_0001.jpg"` opens that picture and lets the arrow keys browse the rest of its folder, in the same name order. A folder path opens that folder. Each double-click opens its own window, like Windows Photo Viewer.
+
+To make it the default for a picture type (do this once per type, for example .jpg, .png, .heic, .cr2):
+
+1. Put `Photo Viewer.exe` where it will stay, for example `C:\Programs\Photo Viewer\`.
+2. In Explorer, right-click a picture of that type, then Open with > Choose another app.
+3. Scroll down and pick More apps > Look for another app on this PC, and select `Photo Viewer.exe`.
+4. Tick "Always use this app to open .jpg files" (Windows 10) or choose Always (Windows 11).
+
+Windows does not let an app make itself the default. After the first time, Photo Viewer is listed under Open with for other types too. If you move the exe, repeat these steps.
+
 ## Build
 
 This crate targets `x86_64-pc-windows-gnu` (`rust-toolchain.toml`).
