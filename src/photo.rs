@@ -409,14 +409,14 @@ impl Library {
     /// folder is read, so it shows up as soon as possible. A file whose
     /// extension is not in the list is still shown if Windows can decode it.
     pub fn open_file(&mut self, hub: &Hub, file: &Path) {
-        self.gen = self.gen.wrapping_add(1);
-        self.decoded.clear();
-        self.failed.clear();
-        self.inflight.clear();
+        // Start over with nothing loaded (an empty path reads no folder).
+        self.open_input(hub, Path::new(""));
         let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-        self.inflight.insert(file.to_path_buf());
-        hub.submit(self.gen, file.to_path_buf());
+        // Decode the clicked file first, while the folder is still being read.
+        self.items = vec![Photo { path: file.to_path_buf(), name: name.clone(), size }];
+        self.current = 0;
+        self.kick(hub);
         self.items = file.parent().map(scan_folder).unwrap_or_default();
         let key = name_key(&name);
         let index = match self.items.iter().position(|p| name_key(&p.name) == key) {
@@ -791,6 +791,12 @@ mod tests {
     }
 
     #[test]
+    fn copied_names_ignore_case() {
+        assert_eq!(name_key("IMG_0001.JPG"), name_key("img_0001.jpg"));
+        assert_ne!(name_key("a.jpg"), name_key("b.jpg"));
+    }
+
+    #[test]
     fn opens_a_file_inside_its_folder() {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -822,11 +828,5 @@ mod tests {
         assert!(lib.current_decoded().is_some(), "the opened file decodes");
         drop(hub);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn copied_names_ignore_case() {
-        assert_eq!(name_key("IMG_0001.JPG"), name_key("img_0001.jpg"));
-        assert_ne!(name_key("a.jpg"), name_key("b.jpg"));
     }
 }
