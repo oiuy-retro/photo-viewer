@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -192,6 +194,12 @@ struct App {
     exif_scroll: i32,
     shown: Option<PathBuf>,
     back: Backbuffer,
+    /// The visible part of the current picture, already scaled. Repaints that
+    /// do not change the picture or the view (hover, status text) just copy it.
+    pic: Backbuffer,
+    pic_key: Option<(Arc<Decoded>, RECT)>,
+    /// When `PV_TIMING` is set: the picture switched to and when the key was pressed.
+    switch_at: Option<(PathBuf, Instant)>,
     face: windows::Win32::Graphics::Gdi::HBRUSH,
 }
 
@@ -531,6 +539,9 @@ impl App {
             exif_scroll: 0,
             shown: None,
             back: Backbuffer::empty(),
+            pic: Backbuffer::empty(),
+            pic_key: None,
+            switch_at: None,
             face,
         }
     }
@@ -545,6 +556,7 @@ impl App {
             x if x == WM_SIZE => {
                 if wparam.0 != 1 {
                     self.sync_dpi();
+                    self.update_target();
                     self.apply_region();
                     self.redraw();
                 }
@@ -554,6 +566,7 @@ impl App {
                 // The new DPI is in the low word of wparam; lparam is the
                 // window rect Windows suggests for the new monitor.
                 self.set_dpi((wparam.0 & 0xFFFF) as i32);
+                self.update_target();
                 let rect = unsafe { &*(lparam.0 as *const RECT) };
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
@@ -570,6 +583,12 @@ impl App {
                 self.apply_region();
                 self.redraw();
                 Action::None
+            }
+            x if x == windows::Win32::UI::WindowsAndMessaging::WM_MOVE
+                || x == windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE =>
+            {
+                self.update_target();
+                Action::Pass
             }
             x if x == WM_NCHITTEST => self.hit_test(lparam),
             x if x == WM_SETCURSOR => self.set_cursor(),
@@ -606,6 +625,7 @@ impl App {
             x if x == WM_DESTROY => {
                 self.hub.set_hwnd(luna::null_hwnd());
                 self.back.destroy();
+                self.pic.destroy();
                 self.fonts.drop_all();
                 unsafe { PostQuitMessage(0) };
                 Action::None
@@ -1253,6 +1273,9 @@ impl App {
                 } else {
                     let delta = if vk == VK_LEFT.0 || vk == VK_UP.0 { -1 } else { 1 };
                     if self.lib.go(&self.hub, delta) {
+                        if photo::timing_enabled() {
+                            self.switch_at = self.lib.current_photo().map(|p| (p.path.clone(), Instant::now()));
+                        }
                         self.sync_view();
                         self.notice.clear();
                         self.redraw();
@@ -1364,7 +1387,47 @@ impl App {
         )
     }
 
+    /// Tell the decoder the height of the monitor the window is on, so
+    /// pictures are decoded to that screen's size. Called on resize, move,
+    /// DPI change and display change; when the height changes, copies made
+    /// for a shorter screen are decoded again.
+    fn update_target(&mut self) {
+        unsafe {
+            let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                let h = (mi.rcMonitor.bottom - mi.rcMonitor.top).max(0) as u32;
+                if self.hub.set_target_height(h) && self.screen == Screen::View {
+                    self.lib.kick(&self.hub);
+                }
+            }
+        }
+    }
+
+    /// Zoomed in past the screen-size copy: ask for every pixel. The
+    /// screen-size copy is shown stretched until they arrive.
+    fn refine(&mut self) {
+        if self.screen != Screen::View {
+            return;
+        }
+        let Some(img) = self.lib.current_decoded() else {
+            return;
+        };
+        if img.full {
+            return;
+        }
+        let l = self.layout();
+        let (_, _, dw, dh, _) = self.dest_rect(&img, l.well_inner);
+        if dw as f64 > img.pix_w as f64 * 1.02 || dh as f64 > img.pix_h as f64 * 1.02 {
+            self.lib.want_full(&self.hub);
+        }
+    }
+
     fn paint(&mut self) {
+        self.refine();
         unsafe {
             let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
@@ -1574,7 +1637,7 @@ impl App {
         parts.join("  ·  ")
     }
 
-    fn draw_image(&self, hdc: HDC, well: RECT) {
+    fn draw_image(&mut self, hdc: HDC, well: RECT) {
         if let Some(err) = self.lib.current_error() {
             luna::text_left(
                 hdc,
@@ -1598,55 +1661,51 @@ impl App {
             luna::text_left(hdc, self.fonts.tahoma9, luna::inset(well, 12), msg, luna::WHITE);
             return;
         };
-        let (dx, dy, dw, dh, scale) = self.dest_rect(&img, well);
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: img.width as i32,
-            biHeight: -(img.height as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
+        let (dx, dy, dw, dh, _) = self.dest_rect(&img, well);
+        let dest = RECT { left: dx, top: dy, right: dx + dw, bottom: dy + dh };
+        let vis = RECT {
+            left: dest.left.max(well.left),
+            top: dest.top.max(well.top),
+            right: dest.right.min(well.right),
+            bottom: dest.bottom.min(well.bottom),
         };
-        unsafe {
-            IntersectClipRect(hdc, well.left, well.top, well.right, well.bottom);
-            let bits = img.bgra.as_ptr() as *const core::ffi::c_void;
-            if (scale - 1.0).abs() < 0.001 {
-                SetDIBitsToDevice(
-                    hdc,
-                    dx,
-                    dy,
-                    dw as u32,
-                    dh as u32,
-                    0,
-                    0,
-                    0,
-                    img.height,
-                    bits,
-                    &info,
-                    DIB_RGB_COLORS,
-                );
-            } else {
-                SetStretchBltMode(hdc, HALFTONE);
-                let _ = SetBrushOrgEx(hdc, 0, 0, None);
-                StretchDIBits(
-                    hdc,
-                    dx,
-                    dy,
-                    dw,
-                    dh,
-                    0,
-                    0,
-                    img.width as i32,
-                    img.height as i32,
-                    Some(bits),
-                    &info,
-                    DIB_RGB_COLORS,
-                    SRCCOPY,
-                );
+        let (vw, vh) = (vis.right - vis.left, vis.bottom - vis.top);
+        if vw > 0 && vh > 0 {
+            // Scale once per picture/view into a cached bitmap; every other
+            // repaint is a plain copy.
+            let at = RECT { left: dx - vis.left, top: dy - vis.top, right: dw, bottom: dh };
+            let cached = |k: &Option<(Arc<Decoded>, RECT)>| {
+                k.as_ref().map(|(d, r)| Arc::ptr_eq(d, &img) && *r == at).unwrap_or(false)
+            };
+            if !cached(&self.pic_key) || self.pic.w != vw || self.pic.h != vh {
+                self.pic.ensure(self.hwnd, vw, vh);
+                if !self.pic.dc.0.is_null() {
+                    stretch(self.pic.dc, &img, dx - vis.left, dy - vis.top, dw, dh);
+                    self.pic_key = Some((Arc::clone(&img), at));
+                }
             }
-            SelectClipRgn(hdc, HRGN(std::ptr::null_mut()));
+            unsafe {
+                if cached(&self.pic_key) {
+                    let _ = BitBlt(hdc, vis.left, vis.top, vw, vh, self.pic.dc, 0, 0, SRCCOPY);
+                } else {
+                    IntersectClipRect(hdc, well.left, well.top, well.right, well.bottom);
+                    stretch(hdc, &img, dx, dy, dw, dh);
+                    SelectClipRgn(hdc, HRGN(std::ptr::null_mut()));
+                }
+            }
+        }
+        if let Some((path, at)) = &self.switch_at {
+            if self.lib.current_photo().map(|p| &p.path == path).unwrap_or(false) {
+                photo::timing_log(&format!(
+                    "switch {} on screen {:.0} ms after the key ({}x{} {})",
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    at.elapsed().as_secs_f64() * 1000.0,
+                    img.pix_w,
+                    img.pix_h,
+                    if img.full { "full" } else { "screen copy" }
+                ));
+            }
+            self.switch_at = None;
         }
     }
 
@@ -1656,9 +1715,7 @@ impl App {
         luna::group_header(hdc, l.exif_header, "Properties", self.fonts.verdana);
         let props = self
             .lib
-            .current_decoded()
-            .map(|d| d.props.clone())
-            .unwrap_or_default();
+            .current_props();
         let label_h = scale(13, self.dpi);
         let value_h = scale(15, self.dpi);
         let block = label_h + value_h + scale(6, self.dpi);
@@ -1705,4 +1762,43 @@ impl App {
     }
 }
 
-
+/// Draw `img` scaled to `dw` × `dh` at (`x`, `y`). Exact 1:1 copies skip the
+/// smoothing pass.
+fn stretch(hdc: HDC, img: &Decoded, x: i32, y: i32, dw: i32, dh: i32) {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: img.pix_w as i32,
+            biHeight: -(img.pix_h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    unsafe {
+        let bits = img.bgra.as_ptr() as *const core::ffi::c_void;
+        if dw == img.pix_w as i32 && dh == img.pix_h as i32 {
+            SetDIBitsToDevice(hdc, x, y, dw as u32, dh as u32, 0, 0, 0, img.pix_h, bits, &info, DIB_RGB_COLORS);
+        } else {
+            SetStretchBltMode(hdc, HALFTONE);
+            let _ = SetBrushOrgEx(hdc, 0, 0, None);
+            StretchDIBits(
+                hdc,
+                x,
+                y,
+                dw,
+                dh,
+                0,
+                0,
+                img.pix_w as i32,
+                img.pix_h as i32,
+                Some(bits),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+    }
+}

@@ -1,16 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICBitmapSource,
-    IWICImagingFactory,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGR,
+    GUID_WICPixelFormat32bppBGRA, GUID_WICPixelFormat8bppGray, IWICBitmapFrameDecode, IWICBitmapSource,
+    IWICBitmapSourceTransform, IWICImagingFactory, WICBitmapInterpolationModeFant, WICBitmapTransformRotate0,
     IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal,
     WICBitmapTransformFlipVertical, WICBitmapTransformOptions, WICBitmapTransformRotate180,
     WICBitmapTransformRotate270, WICBitmapTransformRotate90, WICDecodeMetadataCacheOnDemand,
@@ -98,8 +99,15 @@ pub struct Photo {
 }
 
 pub struct Decoded {
+    /// Size of the picture itself (after EXIF rotation), even when the pixels
+    /// below were decoded smaller.
     pub width: u32,
     pub height: u32,
+    /// Size of `bgra`. Smaller than `width` × `height` for a screen-size decode.
+    pub pix_w: u32,
+    pub pix_h: u32,
+    /// True when `bgra` holds every pixel of the picture.
+    pub full: bool,
     pub bgra: Vec<u8>,
     pub props: Vec<(String, String)>,
 }
@@ -110,96 +118,196 @@ impl Decoded {
     }
 }
 
+pub enum Payload {
+    Image(Result<Arc<Decoded>, String>),
+    Props(Vec<(String, String)>),
+}
+
 pub struct Done {
     pub gen: u64,
     pub path: PathBuf,
-    pub result: Result<Arc<Decoded>, String>,
+    pub full: bool,
+    pub payload: Payload,
 }
 
-struct Job {
-    gen: u64,
-    path: PathBuf,
+#[derive(Clone)]
+pub struct Job {
+    pub gen: u64,
+    pub path: PathBuf,
+    /// Decode every pixel instead of a screen-size copy.
+    pub full: bool,
+    /// The picture on screen. Urgent jobs jump the queue and always have a
+    /// free worker; preloads never use the last worker.
+    pub urgent: bool,
+}
+
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<Job>,
+    running: Vec<(PathBuf, bool)>,
+    /// Finished but not yet picked up by `drain`, so not scheduled again.
+    pending: Vec<(PathBuf, bool)>,
+    running_bg: usize,
+    stop: bool,
+}
+
+struct Shared {
+    queue: Mutex<Queue>,
+    wake: Condvar,
+    results: Mutex<Vec<Done>>,
+    hwnd: AtomicIsize,
+    /// Height in pixels of the monitor the window is on. Preloads are decoded
+    /// to this height so showing one is a cheap copy, not a full-size scale.
+    target_h: AtomicU32,
+    workers: usize,
 }
 
 pub struct Hub {
-    tx: Sender<Option<Job>>,
-    results: Arc<Mutex<Vec<Done>>>,
-    hwnd: Arc<AtomicIsize>,
+    shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Hub {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Option<Job>>();
-        let rx = Arc::new(Mutex::new(rx));
-        let results = Arc::new(Mutex::new(Vec::new()));
-        let hwnd = Arc::new(AtomicIsize::new(0));
         let n = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4)
-            .clamp(2, 4);
-        let mut workers = Vec::new();
-        for _ in 0..n {
-            let rx = Arc::clone(&rx);
-            let results = Arc::clone(&results);
-            let hwnd = Arc::clone(&hwnd);
-            workers.push(std::thread::spawn(move || worker(rx, results, hwnd)));
-        }
-        Self { tx, results, hwnd, workers }
+            .clamp(2, 6);
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue::default()),
+            wake: Condvar::new(),
+            results: Mutex::new(Vec::new()),
+            hwnd: AtomicIsize::new(0),
+            target_h: AtomicU32::new(1080),
+            workers: n,
+        });
+        let workers = (0..n)
+            .map(|_| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || worker(shared))
+            })
+            .collect();
+        Self { shared, workers }
     }
 
     pub fn set_hwnd(&self, hwnd: HWND) {
-        self.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+        self.shared.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
     }
 
-    pub fn submit(&self, gen: u64, path: PathBuf) {
-        let _ = self.tx.send(Some(Job { gen, path }));
+    /// Returns true when the height changed.
+    pub fn set_target_height(&self, h: u32) -> bool {
+        h > 0 && self.shared.target_h.swap(h, Ordering::SeqCst) != h
+    }
+
+    pub fn target_height(&self) -> u32 {
+        self.shared.target_h.load(Ordering::SeqCst)
+    }
+
+    /// Replace everything still waiting with `jobs` (most wanted first).
+    /// Preloads that are no longer near the current picture are dropped here
+    /// instead of making the picture you jumped to wait behind them.
+    pub fn schedule(&self, jobs: Vec<Job>) {
+        let mut q = self.shared.queue.lock().unwrap();
+        let busy: Vec<(PathBuf, bool)> = q.running.iter().chain(q.pending.iter()).cloned().collect();
+        q.jobs = jobs
+            .into_iter()
+            .filter(|j| !busy.iter().any(|(p, f)| *p == j.path && *f == j.full))
+            .collect();
+        drop(q);
+        self.shared.wake.notify_all();
     }
 
     pub fn drain(&self) -> Vec<Done> {
-        let mut guard = self.results.lock().unwrap();
-        std::mem::take(&mut *guard)
+        let done = std::mem::take(&mut *self.shared.results.lock().unwrap());
+        let mut q = self.shared.queue.lock().unwrap();
+        for d in &done {
+            if matches!(d.payload, Payload::Image(_)) {
+                if let Some(i) = q.pending.iter().position(|(p, f)| *p == d.path && *f == d.full) {
+                    q.pending.remove(i);
+                }
+            }
+        }
+        done
     }
 }
 
 impl Drop for Hub {
     fn drop(&mut self) {
-        self.hwnd.store(0, Ordering::SeqCst);
-        for _ in 0..self.workers.len() {
-            let _ = self.tx.send(None);
+        self.shared.hwnd.store(0, Ordering::SeqCst);
+        {
+            let mut q = self.shared.queue.lock().unwrap();
+            q.stop = true;
+            q.jobs.clear();
         }
+        self.shared.wake.notify_all();
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
 }
 
-fn worker(rx: Arc<Mutex<Receiver<Option<Job>>>>, results: Arc<Mutex<Vec<Done>>>, hwnd: Arc<AtomicIsize>) {
+fn next_job(shared: &Shared) -> Option<Job> {
+    let mut q = shared.queue.lock().unwrap();
+    loop {
+        if q.stop {
+            return None;
+        }
+        let pick = q
+            .jobs
+            .iter()
+            .position(|j| j.urgent)
+            .or_else(|| (!q.jobs.is_empty() && q.running_bg + 1 < shared.workers).then_some(0));
+        if let Some(i) = pick {
+            let job = q.jobs.remove(i).unwrap();
+            if !job.urgent {
+                q.running_bg += 1;
+            }
+            q.running.push((job.path.clone(), job.full));
+            return Some(job);
+        }
+        q = shared.wake.wait(q).unwrap();
+    }
+}
+
+fn worker(shared: Arc<Shared>) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
-    loop {
-        let job = {
-            let locked = rx.lock().unwrap();
-            locked.recv()
-        };
-        match job {
-            Ok(Some(job)) => {
-                let result = decode_file(&job.path).map(Arc::new);
-                results.lock().unwrap().push(Done {
-                    gen: job.gen,
-                    path: job.path,
-                    result,
-                });
-                let raw = hwnd.load(Ordering::SeqCst);
-                if raw != 0 {
-                    let window = HWND(raw as *mut core::ffi::c_void);
-                    unsafe {
-                        let _ = PostMessageW(window, WM_PHOTO_READY, WPARAM(0), LPARAM(0));
-                    }
-                }
+    while let Some(job) = next_job(&shared) {
+        let target = if job.full { None } else { Some(shared.target_h.load(Ordering::SeqCst)) };
+        let started = Instant::now();
+        let result = decode_file(&job.path, target).map(Arc::new);
+        if timing_enabled() {
+            let what = match &result {
+                Ok(d) => format!("{} {}x{} of {}x{}", if d.full { "full" } else { "screen" }, d.pix_w, d.pix_h, d.width, d.height),
+                Err(e) => format!("failed: {e}"),
+            };
+            timing_log(&format!(
+                "decode {} {} in {:.0} ms{}",
+                file_name(&job.path),
+                what,
+                started.elapsed().as_secs_f64() * 1000.0,
+                if job.urgent { " (on screen)" } else { " (preload)" }
+            ));
+        }
+        let base = result.as_ref().ok().map(|d| d.props.clone());
+        {
+            let mut q = shared.queue.lock().unwrap();
+            q.pending.push((job.path.clone(), job.full));
+            if !job.urgent {
+                q.running_bg -= 1;
             }
-            _ => break,
+            if let Some(i) = q.running.iter().position(|(p, f)| *p == job.path && *f == job.full) {
+                q.running.remove(i);
+            }
+        }
+        post(&shared, Done { gen: job.gen, path: job.path.clone(), full: job.full, payload: Payload::Image(result) });
+        shared.wake.notify_all();
+        // The Properties pane reads the file again through the Shell, which is
+        // slow. Do it after the picture is on screen.
+        if let (Some(mut props), false) = (base, job.full) {
+            read_store(&job.path, &mut props);
+            post(&shared, Done { gen: job.gen, path: job.path, full: false, payload: Payload::Props(props) });
         }
     }
     unsafe {
@@ -207,13 +315,61 @@ fn worker(rx: Arc<Mutex<Receiver<Option<Job>>>>, results: Arc<Mutex<Vec<Done>>>,
     }
 }
 
+fn post(shared: &Shared, done: Done) {
+    shared.results.lock().unwrap().push(done);
+    let raw = shared.hwnd.load(Ordering::SeqCst);
+    if raw != 0 {
+        let window = HWND(raw as *mut core::ffi::c_void);
+        unsafe {
+            let _ = PostMessageW(window, WM_PHOTO_READY, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Set the environment variable `PV_TIMING=1` to log decode and switch times
+/// to `%TEMP%\photo-viewer-timing.log`.
+pub fn timing_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PV_TIMING").is_some_and(|v| v != "0"))
+}
+
+pub fn timing_log(line: &str) {
+    use std::io::Write;
+    static FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::temp_dir().join("photo-viewer-timing.log");
+        Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(path).ok())
+    });
+    if let Ok(mut guard) = file.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// How many pictures to keep decoded ahead of / behind the current one.
+const AHEAD: usize = 8;
+const BEHIND: usize = 3;
+
 pub struct Library {
     pub gen: u64,
     pub items: Vec<Photo>,
     pub current: usize,
     decoded: HashMap<PathBuf, Arc<Decoded>>,
     failed: HashMap<PathBuf, String>,
-    inflight: HashSet<PathBuf>,
+    props: HashMap<PathBuf, Vec<(String, String)>>,
+    /// Every pixel of the current picture, decoded only when zoomed in past
+    /// the screen-size copy. Dropped when the picture changes.
+    full: Option<(PathBuf, Arc<Decoded>)>,
+    want_full: Option<PathBuf>,
+    /// The picture whose full decode has finished (worked or not), so it is not retried.
+    full_tried: Option<PathBuf>,
+    /// +1 when moving forward through the folder, -1 when moving back.
+    dir: i32,
     pub copied: HashSet<String>,
 }
 
@@ -225,7 +381,11 @@ impl Library {
             current: 0,
             decoded: HashMap::new(),
             failed: HashMap::new(),
-            inflight: HashSet::new(),
+            props: HashMap::new(),
+            full: None,
+            want_full: None,
+            full_tried: None,
+            dir: 1,
             copied: HashSet::new(),
         }
     }
@@ -234,9 +394,13 @@ impl Library {
         self.gen = self.gen.wrapping_add(1);
         self.items = scan_folder(folder);
         self.current = 0;
+        self.dir = 1;
         self.decoded.clear();
         self.failed.clear();
-        self.inflight.clear();
+        self.props.clear();
+        self.full = None;
+        self.want_full = None;
+        self.full_tried = None;
         self.kick(hub);
     }
 
@@ -248,8 +412,26 @@ impl Library {
         self.items.get(self.current)
     }
 
+    /// The best copy of the current picture: all pixels if they have been
+    /// decoded, otherwise the screen-size copy.
     pub fn current_decoded(&self) -> Option<Arc<Decoded>> {
-        self.current_photo().and_then(|p| self.decoded.get(&p.path).cloned())
+        let p = self.current_photo()?;
+        if let Some((path, full)) = &self.full {
+            if *path == p.path {
+                return Some(Arc::clone(full));
+            }
+        }
+        self.decoded.get(&p.path).cloned()
+    }
+
+    pub fn current_props(&self) -> Vec<(String, String)> {
+        let Some(p) = self.current_photo() else {
+            return Vec::new();
+        };
+        if let Some(props) = self.props.get(&p.path) {
+            return props.clone();
+        }
+        self.decoded.get(&p.path).map(|d| d.props.clone()).unwrap_or_default()
     }
 
     pub fn current_error(&self) -> Option<&str> {
@@ -265,7 +447,8 @@ impl Library {
     }
 
     pub fn ram_bytes(&self) -> u64 {
-        self.decoded.values().map(|d| d.bytes()).sum()
+        let full = self.full.as_ref().map(|(_, d)| d.bytes()).unwrap_or(0);
+        self.decoded.values().map(|d| d.bytes()).sum::<u64>() + full
     }
 
     pub fn go(&mut self, hub: &Hub, delta: i32) -> bool {
@@ -277,7 +460,39 @@ impl Library {
         if next == self.current {
             return false;
         }
+        self.dir = if next > self.current { 1 } else { -1 };
         self.current = next;
+        self.drop_full();
+        self.kick(hub);
+        true
+    }
+
+    fn drop_full(&mut self) {
+        let current = self.current_photo().map(|p| p.path.clone());
+        if self.full.as_ref().map(|(p, _)| Some(p) != current.as_ref()).unwrap_or(false) {
+            self.full = None;
+        }
+        if self.want_full.as_ref() != current.as_ref() {
+            self.want_full = None;
+        }
+        if self.full_tried.as_ref() != current.as_ref() {
+            self.full_tried = None;
+        }
+    }
+
+    /// Ask for every pixel of the current picture (zoomed in past the
+    /// screen-size copy). Returns true if a decode was started.
+    pub fn want_full(&mut self, hub: &Hub) -> bool {
+        let Some(path) = self.current_photo().map(|p| p.path.clone()) else {
+            return false;
+        };
+        if self.want_full.as_ref() == Some(&path) {
+            return false;
+        }
+        if self.decoded.get(&path).map(|d| d.full).unwrap_or(false) {
+            return false;
+        }
+        self.want_full = Some(path);
         self.kick(hub);
         true
     }
@@ -288,23 +503,32 @@ impl Library {
             return false;
         }
         for item in done {
-            self.inflight.remove(&item.path);
             if item.gen != self.gen {
                 continue;
             }
             if !self.items.iter().any(|p| p.path == item.path) {
                 continue;
             }
-            match item.result {
-                Ok(image) => {
+            match item.payload {
+                Payload::Image(result) if item.full => {
+                    if self.current_photo().map(|p| p.path == item.path).unwrap_or(false) {
+                        self.full_tried = Some(item.path.clone());
+                        if let Ok(image) = result {
+                            self.full = Some((item.path, image));
+                        }
+                    }
+                }
+                Payload::Image(Ok(image)) => {
                     self.decoded.insert(item.path, image);
                 }
-                Err(err) => {
+                Payload::Image(Err(err)) => {
                     self.failed.insert(item.path, err);
+                }
+                Payload::Props(props) => {
+                    self.props.insert(item.path, props);
                 }
             }
         }
-        self.evict();
         self.kick(hub);
         true
     }
@@ -313,34 +537,49 @@ impl Library {
         self.evict();
         let n = self.items.len();
         if n == 0 {
+            hub.schedule(Vec::new());
             return;
         }
         let budget = memory_budget();
         let mut used = self.ram_bytes();
         let avg = if self.decoded.is_empty() {
-            20 * 1024 * 1024
+            // A screen-size copy: roughly 16:9 at the target height.
+            let h = hub.target_height() as u64;
+            (h * h * 16 / 9 * 4).max(1)
         } else {
-            (used / self.decoded.len() as u64).max(1)
+            (self.decoded.values().map(|d| d.bytes()).sum::<u64>() / self.decoded.len() as u64).max(1)
         };
-        let mut inflight = self.inflight.len();
         let current_path = self.items[self.current].path.clone();
-        for idx in priority(self.current, n) {
-            if inflight >= 6 {
-                break;
-            }
-            let path = self.items[idx].path.clone();
-            if self.decoded.contains_key(&path) || self.failed.contains_key(&path) || self.inflight.contains(&path) {
+        let target = hub.target_height();
+        let mut jobs = Vec::new();
+        for idx in priority(self.current, n, self.dir) {
+            let path = &self.items[idx].path;
+            if self.failed.contains_key(path) {
                 continue;
             }
-            let must = path == current_path;
-            if !must && used + avg > budget && !self.decoded.is_empty() {
+            // A screen-size copy made for a shorter monitor is decoded again
+            // at the new height. The old copy stays on screen until then.
+            if let Some(d) = self.decoded.get(path) {
+                if d.full || d.pix_h as u64 * 100 >= d.height.min(target) as u64 * 98 {
+                    continue;
+                }
+            }
+            let urgent = *path == current_path;
+            if !urgent && used + avg > budget && !self.decoded.is_empty() {
                 break;
             }
-            self.inflight.insert(path.clone());
-            hub.submit(self.gen, path);
+            jobs.push(Job { gen: self.gen, path: path.clone(), full: false, urgent });
             used = used.saturating_add(avg);
-            inflight += 1;
         }
+        if self.want_full.as_ref() == Some(&current_path)
+            && self.full.is_none()
+            && self.full_tried.as_ref() != Some(&current_path)
+            && !self.failed.contains_key(&current_path)
+        {
+            let at = if jobs.first().map(|j| j.urgent).unwrap_or(false) { 1 } else { 0 };
+            jobs.insert(at, Job { gen: self.gen, path: current_path, full: true, urgent: true });
+        }
+        hub.schedule(jobs);
     }
 
     fn evict(&mut self) {
@@ -360,6 +599,7 @@ impl Library {
             match farthest {
                 Some(path) => {
                     self.decoded.remove(&path);
+                    self.props.remove(&path);
                 }
                 None => break,
             }
@@ -371,12 +611,13 @@ impl Library {
         recycle(hwnd, &photo.path)?;
         self.decoded.remove(&photo.path);
         self.failed.remove(&photo.path);
-        self.inflight.remove(&photo.path);
+        self.props.remove(&photo.path);
         let index = self.current;
         self.items.remove(index);
         if self.current >= self.items.len() && self.current > 0 {
             self.current -= 1;
         }
+        self.drop_full();
         self.kick(hub);
         Ok(())
     }
@@ -454,17 +695,36 @@ fn is_raw(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn priority(current: usize, n: usize) -> impl Iterator<Item = usize> {
-    std::iter::once(current).chain((1..n).flat_map(move |d| {
-        let mut out = Vec::with_capacity(2);
-        if current + d < n {
-            out.push(current + d);
+/// Current picture first, then the next few in the direction you are moving,
+/// with a couple behind in case you step back.
+fn priority(current: usize, n: usize, dir: i32) -> Vec<usize> {
+    let step = |d: usize, forward: bool| -> Option<usize> {
+        let ahead = (dir >= 0) == forward;
+        if ahead {
+            (current + d < n).then_some(current + d)
+        } else {
+            current.checked_sub(d)
         }
-        if current >= d {
-            out.push(current - d);
+    };
+    let mut out = vec![current];
+    let (mut a, mut b) = (1, 1);
+    while a <= AHEAD || b <= BEHIND {
+        for _ in 0..2 {
+            if a <= AHEAD {
+                if let Some(i) = step(a, true) {
+                    out.push(i);
+                }
+                a += 1;
+            }
         }
-        out
-    }))
+        if b <= BEHIND {
+            if let Some(i) = step(b, false) {
+                out.push(i);
+            }
+            b += 1;
+        }
+    }
+    out
 }
 
 pub fn memory_budget() -> u64 {
@@ -525,7 +785,10 @@ fn recycle(hwnd: HWND, path: &Path) -> Result<(), String> {
     }
 }
 
-pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
+/// Decode a picture. With `target_h`, pictures taller than that are decoded
+/// straight to that height (like Windows Photo Viewer does for the screen);
+/// `None` decodes every pixel.
+pub(crate) fn decode_file(path: &Path, target_h: Option<u32>) -> Result<Decoded, String> {
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).map_err(|e| e.to_string())?;
@@ -535,13 +798,34 @@ pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
             .map_err(|e| open_error(path, &e))?;
         let frame = decoder.GetFrame(0).map_err(|e| e.to_string())?;
         let orient = orientation(&frame);
+        let (mut fw, mut fh) = (0u32, 0u32);
+        frame.GetSize(&mut fw, &mut fh).map_err(|e| e.to_string())?;
+        if fw == 0 || fh == 0 {
+            return Err("The picture has no size.".into());
+        }
+        let turned = orient >= 5;
+        let (width, height) = if turned { (fh, fw) } else { (fw, fh) };
+        // Decode size before EXIF rotation.
+        let (sw, sh) = match target_h {
+            Some(t) if t > 0 && height > t => {
+                let s = t as f64 / height as f64;
+                (((fw as f64 * s).round() as u32).max(1), ((fh as f64 * s).round() as u32).max(1))
+            }
+            _ => (fw, fh),
+        };
+        let shrink = sw != fw || sh != fh;
 
         // Full decode first. RAW codecs can fail here (or while copying the
         // pixels) on files they only partly understand, so fall back to the
         // full-size JPEG preview most cameras embed, then to the thumbnail.
         let mut preview = false;
         let source: IWICBitmapSource = frame.cast().map_err(|e| e.to_string())?;
-        let (width, height, bgra) = match to_bgra(&factory, &source, orient) {
+        let first = if shrink {
+            scaled(&factory, &frame, fw, fh, sw, sh).and_then(|s| to_bgra(&factory, &s, orient))
+        } else {
+            to_bgra(&factory, &source, orient)
+        };
+        let (pix_w, pix_h, bgra) = match first {
             Ok(px) => px,
             Err(full_err) => {
                 let fallbacks = [
@@ -551,6 +835,7 @@ pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
                 ];
                 let mut found = None;
                 for small in fallbacks.into_iter().flatten() {
+                    let small = fit_within(&factory, small, target_h);
                     if let Ok(px) = to_bgra(&factory, &small, orient) {
                         found = Some(px);
                         break;
@@ -570,6 +855,9 @@ pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
                 }
             }
         };
+        // An embedded preview is the best this file can give, so it counts as full.
+        let (width, height) = if preview { (pix_w, pix_h) } else { (width, height) };
+        let full = preview || !shrink;
 
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut props = vec![
@@ -579,9 +867,90 @@ pub(crate) fn decode_file(path: &Path) -> Result<Decoded, String> {
         if preview {
             props.push(("Shown".into(), "Embedded preview (full RAW decode failed)".into()));
         }
-        read_store(path, &mut props);
-        Ok(Decoded { width, height, bgra, props })
+        Ok(Decoded { width, height, pix_w, pix_h, full, bgra, props })
     }
+}
+
+/// Scale a decoder frame down to `w` × `h`. JPEG (and some other) decoders can
+/// skip most of the work by decoding at 1/2, 1/4 or 1/8 size; use that when
+/// it is still at least as big as needed, then finish with a smooth scale.
+unsafe fn scaled(
+    factory: &IWICImagingFactory,
+    frame: &IWICBitmapFrameDecode,
+    fw: u32,
+    fh: u32,
+    w: u32,
+    h: u32,
+) -> Result<IWICBitmapSource, String> {
+    let mut src: IWICBitmapSource = frame.cast().map_err(|e| e.to_string())?;
+    if let Some(native) = native_downscale(factory, frame, fw, fh, w, h) {
+        src = native;
+    }
+    let scaler = factory.CreateBitmapScaler().map_err(|e| e.to_string())?;
+    scaler.Initialize(&src, w, h, WICBitmapInterpolationModeFant).map_err(|e| e.to_string())?;
+    scaler.cast().map_err(|e| e.to_string())
+}
+
+unsafe fn native_downscale(
+    factory: &IWICImagingFactory,
+    frame: &IWICBitmapFrameDecode,
+    fw: u32,
+    fh: u32,
+    w: u32,
+    h: u32,
+) -> Option<IWICBitmapSource> {
+    let st: IWICBitmapSourceTransform = frame.cast().ok()?;
+    let mut size = None;
+    for k in [8u32, 4, 2] {
+        let (rw, rh) = (fw.div_ceil(k), fh.div_ceil(k));
+        if rw < w || rh < h {
+            continue;
+        }
+        let (mut nw, mut nh) = (rw, rh);
+        if st.GetClosestSize(&mut nw, &mut nh).is_ok() && nw >= w && nh >= h && nw < fw && nh < fh {
+            size = Some((nw, nh));
+            break;
+        }
+    }
+    let (nw, nh) = size?;
+    let mut format = GUID_WICPixelFormat32bppBGRA;
+    st.GetClosestPixelFormat(&mut format).ok()?;
+    let bytes = if format == GUID_WICPixelFormat32bppBGRA || format == GUID_WICPixelFormat32bppBGR {
+        4
+    } else if format == GUID_WICPixelFormat24bppBGR {
+        3
+    } else if format == GUID_WICPixelFormat8bppGray {
+        1
+    } else {
+        return None;
+    };
+    let stride = (nw.checked_mul(bytes)? + 3) & !3;
+    let len = (stride as usize).checked_mul(nh as usize)?;
+    let mut buf = Vec::new();
+    buf.try_reserve(len).ok()?;
+    buf.resize(len, 0);
+    st.CopyPixels(std::ptr::null(), nw, nh, &format, WICBitmapTransformRotate0, stride, &mut buf).ok()?;
+    let bitmap = factory.CreateBitmapFromMemory(nw, nh, &format, stride, &buf).ok()?;
+    bitmap.cast().ok()
+}
+
+/// Shrink an embedded preview to the target height if it is taller.
+unsafe fn fit_within(factory: &IWICImagingFactory, src: IWICBitmapSource, target_h: Option<u32>) -> IWICBitmapSource {
+    let Some(t) = target_h.filter(|t| *t > 0) else {
+        return src;
+    };
+    let (mut w, mut h) = (0u32, 0u32);
+    if src.GetSize(&mut w, &mut h).is_err() || h <= t || w == 0 {
+        return src;
+    }
+    let nw = ((w as f64 * t as f64 / h as f64).round() as u32).max(1);
+    let Ok(scaler) = factory.CreateBitmapScaler() else {
+        return src;
+    };
+    if scaler.Initialize(&src, nw, t, WICBitmapInterpolationModeFant).is_err() {
+        return src;
+    }
+    scaler.cast().unwrap_or(src)
 }
 
 /// Plain-language message when Windows cannot open a file at all.
@@ -743,7 +1112,7 @@ mod tests {
         let items = scan_folder(&folder);
         assert!(!items.is_empty(), "expected pictures, got {}", items.len());
         assert!(items.iter().any(|p| p.name.eq_ignore_ascii_case("sample.jpg")));
-        let decoded = decode_file(&items[0].path).expect("decode");
+        let decoded = decode_file(&items[0].path, None).expect("decode");
         assert!(decoded.width > 0 && decoded.height > 0);
         assert_eq!(decoded.bgra.len(), decoded.width as usize * decoded.height as usize * 4);
         assert!(decoded.props.iter().any(|(k, _)| k == "Dimensions"));
@@ -753,8 +1122,137 @@ mod tests {
     }
 
     #[test]
+    fn preloads_follow_direction() {
+        assert_eq!(priority(5, 20, 1)[..6], [5, 6, 7, 4, 8, 9]);
+        assert_eq!(priority(5, 20, -1)[..6], [5, 4, 3, 6, 2, 1]);
+        let all = priority(0, 3, 1);
+        assert_eq!(all, vec![0, 1, 2]);
+        assert!(priority(0, 1, -1) == vec![0]);
+    }
+
+    #[test]
+    fn screen_copy_is_smaller_but_keeps_real_size() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sample.jpg");
+        let full = decode_file(&path, None).expect("full");
+        assert!(full.full && full.pix_w == full.width);
+        let small = decode_file(&path, Some((full.height / 2).max(1))).expect("small");
+        assert_eq!((small.width, small.height), (full.width, full.height));
+        assert_eq!(small.pix_h, (full.height / 2).max(1));
+        assert!(!small.full);
+        assert_eq!(small.bgra.len(), small.pix_w as usize * small.pix_h as usize * 4);
+    }
+
+    #[test]
     fn copied_names_ignore_case() {
         assert_eq!(name_key("IMG_0001.JPG"), name_key("img_0001.jpg"));
         assert_ne!(name_key("a.jpg"), name_key("b.jpg"));
+    }
+}
+
+/// Timing benchmark, not run by `cargo test`. Point `PV_BENCH_DIR` at a folder
+/// of large JPEGs and run `cargo test --release -- --ignored --nocapture bench`.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
+        SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HALFTONE, SRCCOPY,
+    };
+
+    fn ms(t: Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// One fit-height draw into a 1400 × 800 window, like a repaint does.
+    fn paint_ms(d: &Decoded) -> f64 {
+        let t = Instant::now();
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, 1400, 800);
+            ReleaseDC(None, screen);
+            let old = SelectObject(dc, bmp);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: d.pix_w as i32,
+                    biHeight: -(d.pix_h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            SetStretchBltMode(dc, HALFTONE);
+            let dw = (d.width as f64 * 800.0 / d.height as f64) as i32;
+            StretchDIBits(dc, 0, 0, dw, 800, 0, 0, d.pix_w as i32, d.pix_h as i32, Some(d.bgra.as_ptr() as _), &info, DIB_RGB_COLORS, SRCCOPY);
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(dc);
+        }
+        ms(t)
+    }
+
+    #[test]
+    #[ignore]
+    fn bench() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let Some(dir) = std::env::var_os("PV_BENCH_DIR") else {
+            return;
+        };
+        let items = scan_folder(Path::new(&dir));
+        unsafe {
+            let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
+            let wide = path_wide(&items[0].path);
+            let decoder = factory
+                .CreateDecoderFromFilename(PCWSTR(wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
+                .unwrap();
+            let frame = decoder.GetFrame(0).unwrap();
+            println!("BENCH JPEG decoder can scale while decoding: {}", frame.cast::<IWICBitmapSourceTransform>().is_ok());
+        }
+        for p in &items {
+            let t = Instant::now();
+            let full = decode_file(&p.path, None).unwrap();
+            let full_ms = ms(t);
+            let t = Instant::now();
+            let screen = decode_file(&p.path, Some(1080)).unwrap();
+            let screen_ms = ms(t);
+            println!(
+                "BENCH {}: full {:.0} ms + paint {:.0} ms ({:.0} MB) | screen copy {}x{} {:.0} ms + paint {:.0} ms ({:.1} MB)",
+                p.name,
+                full_ms,
+                paint_ms(&full),
+                full.bytes() as f64 / 1048576.0,
+                screen.pix_w,
+                screen.pix_h,
+                screen_ms,
+                paint_ms(&screen),
+                screen.bytes() as f64 / 1048576.0
+            );
+        }
+        // Jump to a picture while the others are still being preloaded.
+        let hub = Hub::new();
+        hub.set_target_height(1080);
+        let job = |p: &Photo, urgent| Job { gen: 1, path: p.path.clone(), full: false, urgent };
+        hub.schedule(items.iter().skip(1).map(|p| job(p, false)).collect());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t = Instant::now();
+        let mut jobs = vec![job(&items[0], true)];
+        jobs.extend(items.iter().skip(1).map(|p| job(p, false)));
+        hub.schedule(jobs);
+        'wait: loop {
+            for d in hub.drain() {
+                if d.path == items[0].path && matches!(d.payload, Payload::Image(_)) {
+                    break 'wait;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        println!("BENCH switch-wait {:.0} ms", ms(t));
     }
 }
