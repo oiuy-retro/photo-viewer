@@ -13,7 +13,7 @@ A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/
 - Wide pictures that do not fit across the window at fit height can be zoomed out further with the mouse wheel, down to fit width.
 - Thin name bar with the filename and a Folders button. Esc or Folders returns to Start without unloading the browsed paths.
 - EXIF / property pane (camera, dates, GPS, and the rest that WIC exposes).
-- Decoded BGRA stays in RAM around the current index; the whole folder if it fits. Decode uses a few worker threads.
+- Switching is meant to feel instant. Worker threads decode the next pictures in the direction you are moving (8 ahead, 3 behind) at the monitor's height, so the next picture is usually already in RAM and is just copied to the screen. The picture you jump to always goes first. Full resolution is decoded only when you zoom in past screen size.
 
 Formats are whatever WIC on that machine can open: JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, HEIC/HEIF (if the codecs are installed), JPEG XR, AVIF, and similar.
 
@@ -39,6 +39,8 @@ cargo test
 ```
 
 Tests decode `tests/fixtures/sample.jpg`.
+
+`cargo test --release -- --ignored --nocapture bench` with `PV_BENCH_DIR` set to a folder of large JPEGs prints decode and draw times. Run the app with `PV_TIMING=1` to log decode times and how long each switch took to `%TEMP%\photo-viewer-timing.log`.
 
 ## License
 
