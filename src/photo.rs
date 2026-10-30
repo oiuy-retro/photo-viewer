@@ -403,6 +403,48 @@ impl Library {
         self.copied.insert(name_key(&photo.name));
         Ok("Copied.")
     }
+
+    /// Open the folder `file` is in, starting at `file` (for example after a
+    /// double-click in Explorer). The file is sent to a decoder before the
+    /// folder is read, so it shows up as soon as possible. A file whose
+    /// extension is not in the list is still shown if Windows can decode it.
+    pub fn open_file(&mut self, hub: &Hub, file: &Path) {
+        // Start over with nothing loaded (an empty path reads no folder).
+        self.open_input(hub, Path::new(""));
+        let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        // Decode the clicked file first, while the folder is still being read.
+        self.items = vec![Photo { path: file.to_path_buf(), name: name.clone(), size }];
+        self.current = 0;
+        self.kick(hub);
+        self.items = file.parent().map(scan_folder).unwrap_or_default();
+        let key = name_key(&name);
+        let index = match self.items.iter().position(|p| name_key(&p.name) == key) {
+            Some(i) => {
+                // Use the exact path that is already decoding.
+                self.items[i].path = file.to_path_buf();
+                i
+            }
+            None => {
+                let i = self
+                    .items
+                    .iter()
+                    .position(|p| logical_cmp(&name, &p.name) == std::cmp::Ordering::Less)
+                    .unwrap_or(self.items.len());
+                self.items.insert(i, Photo { path: file.to_path_buf(), name, size });
+                i
+            }
+        };
+        self.current = index;
+        self.kick(hub);
+    }
+}
+
+/// Explorer-style name order ("img2" before "img10").
+fn logical_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let wa = luna::wide(a);
+    let wb = luna::wide(b);
+    unsafe { StrCmpLogicalW(PCWSTR(wa.as_ptr()), PCWSTR(wb.as_ptr())).cmp(&0) }
 }
 
 pub fn scan_folder(folder: &Path) -> Vec<Photo> {
@@ -419,11 +461,7 @@ pub fn scan_folder(folder: &Path) -> Vec<Photo> {
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         items.push(Photo { path, name, size });
     }
-    items.sort_by(|a, b| {
-        let wa = luna::wide(&a.name);
-        let wb = luna::wide(&b.name);
-        unsafe { StrCmpLogicalW(PCWSTR(wa.as_ptr()), PCWSTR(wb.as_ptr())).cmp(&0) }
-    });
+    items.sort_by(|a, b| logical_cmp(&a.name, &b.name));
     items
 }
 
@@ -756,5 +794,39 @@ mod tests {
     fn copied_names_ignore_case() {
         assert_eq!(name_key("IMG_0001.JPG"), name_key("img_0001.jpg"));
         assert_ne!(name_key("a.jpg"), name_key("b.jpg"));
+    }
+
+    #[test]
+    fn opens_a_file_inside_its_folder() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let dir = std::env::temp_dir().join(format!("pv-open-file-ä-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sample.jpg");
+        for name in ["img1.jpg", "img2.jpg", "img10.jpg", "Bild ö.jpg"] {
+            std::fs::copy(&sample, dir.join(name)).unwrap();
+        }
+        // Not a listed extension: still opened, in name order.
+        std::fs::copy(&sample, dir.join("img3.photo")).unwrap();
+        let hub = Hub::new();
+        let mut lib = Library::new();
+        lib.open_file(&hub, &dir.join("IMG2.JPG"));
+        let names: Vec<_> = lib.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Bild ö.jpg", "img1.jpg", "img2.jpg", "img10.jpg"]);
+        assert_eq!(lib.current, 2);
+        lib.open_file(&hub, &dir.join("img3.photo"));
+        let names: Vec<_> = lib.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Bild ö.jpg", "img1.jpg", "img2.jpg", "img3.photo", "img10.jpg"]);
+        assert_eq!(lib.current, 3);
+        let start = std::time::Instant::now();
+        while lib.current_decoded().is_none() && start.elapsed().as_secs() < 10 {
+            lib.apply(&hub);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(lib.current_decoded().is_some(), "the opened file decodes");
+        drop(hub);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

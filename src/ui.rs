@@ -213,6 +213,15 @@ pub fn run() -> i32 {
                 app.hub.set_hwnd(hwnd);
             }
         });
+        // Explorer starts us with the picture's path when Photo Viewer is the
+        // default app ("Photo Viewer.exe" "C:\\path\\to\\photo.jpg").
+        if let Some(arg) = std::env::args_os().nth(1) {
+            APP.with(|slot| {
+                if let Some(app) = slot.borrow_mut().as_mut() {
+                    app.open_path(PathBuf::from(arg));
+                }
+            });
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
         let mut msg = MSG::default();
@@ -903,6 +912,36 @@ impl App {
             self.lib.set_output(PathBuf::from(&self.output).as_path());
         }
         self.screen = Screen::View;
+    }
+
+    /// Open a picture or folder given on the command line.
+    fn open_path(&mut self, path: PathBuf) {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                self.set_input(path.to_string_lossy().into_owned());
+                self.open_view();
+            }
+            Ok(_) => {
+                let folder = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                self.set_input(folder);
+                self.view = View::FitHeight;
+                self.exif_scroll = 0;
+                self.shown = None;
+                self.notice.clear();
+                self.lib.open_file(&self.hub, &path);
+                self.screen = Screen::View;
+                self.sync_view();
+            }
+            Err(err) => {
+                let why = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    "Access denied"
+                } else {
+                    "Not found"
+                };
+                self.notice = format!("{why}: {}", path.display());
+            }
+        }
     }
 
     fn back_to_start(&mut self) {
