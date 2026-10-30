@@ -584,6 +584,12 @@ impl App {
                 self.redraw();
                 Action::None
             }
+            x if x == windows::Win32::UI::WindowsAndMessaging::WM_MOVE
+                || x == windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE =>
+            {
+                self.update_target();
+                Action::Pass
+            }
             x if x == WM_NCHITTEST => self.hit_test(lparam),
             x if x == WM_SETCURSOR => self.set_cursor(),
             x if x == WM_ACTIVATE => {
@@ -1381,8 +1387,11 @@ impl App {
         )
     }
 
-    /// Tell the decoder the monitor height, so preloads are decoded to screen size.
-    fn update_target(&self) {
+    /// Tell the decoder the height of the monitor the window is on, so
+    /// pictures are decoded to that screen's size. Called on resize, move,
+    /// DPI change and display change; when the height changes, copies made
+    /// for a shorter screen are decoded again.
+    fn update_target(&mut self) {
         unsafe {
             let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
@@ -1390,7 +1399,10 @@ impl App {
                 ..Default::default()
             };
             if GetMonitorInfoW(monitor, &mut mi).as_bool() {
-                self.hub.set_target_height((mi.rcMonitor.bottom - mi.rcMonitor.top).max(0) as u32);
+                let h = (mi.rcMonitor.bottom - mi.rcMonitor.top).max(0) as u32;
+                if self.hub.set_target_height(h) && self.screen == Screen::View {
+                    self.lib.kick(&self.hub);
+                }
             }
         }
     }

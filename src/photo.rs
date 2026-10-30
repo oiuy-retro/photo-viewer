@@ -194,10 +194,9 @@ impl Hub {
         self.shared.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
     }
 
-    pub fn set_target_height(&self, h: u32) {
-        if h > 0 {
-            self.shared.target_h.store(h, Ordering::SeqCst);
-        }
+    /// Returns true when the height changed.
+    pub fn set_target_height(&self, h: u32) -> bool {
+        h > 0 && self.shared.target_h.swap(h, Ordering::SeqCst) != h
     }
 
     pub fn target_height(&self) -> u32 {
@@ -551,11 +550,19 @@ impl Library {
             (self.decoded.values().map(|d| d.bytes()).sum::<u64>() / self.decoded.len() as u64).max(1)
         };
         let current_path = self.items[self.current].path.clone();
+        let target = hub.target_height();
         let mut jobs = Vec::new();
         for idx in priority(self.current, n, self.dir) {
             let path = &self.items[idx].path;
-            if self.decoded.contains_key(path) || self.failed.contains_key(path) {
+            if self.failed.contains_key(path) {
                 continue;
+            }
+            // A screen-size copy made for a shorter monitor is decoded again
+            // at the new height. The old copy stays on screen until then.
+            if let Some(d) = self.decoded.get(path) {
+                if d.full || d.pix_h as u64 * 100 >= d.height.min(target) as u64 * 98 {
+                    continue;
+                }
             }
             let urgent = *path == current_path;
             if !urgent && used + avg > budget && !self.decoded.is_empty() {
