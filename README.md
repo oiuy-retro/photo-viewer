@@ -21,6 +21,16 @@ Camera RAW files (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, SRW and others) a
 
 Maximize fills the monitor work area. The rounded window region is cleared while maximized.
 
+## Configuration file
+
+Photo Viewer keeps its settings in a plain text file called `configuration.conf` in the same folder as `Photo Viewer.exe`. If the file is missing, the app writes one with comments explaining every line the first time it starts. You can open it in Notepad and edit it while the app is closed. Lines that start with `#` are comments, `[name]` starts a section, and every setting is a `key = value` line. Key names are not case-sensitive, lines the app does not recognise are ignored, and deleting a line puts that setting back to its default.
+
+The `[folders]` section remembers where each Browse button last left off. `input` is the folder last picked with the Input folder button and `output` is the folder last picked with the Output folder button, for example `input = D:\Photos` and `output = E:\Picks`. Each button opens at its own remembered folder. If that folder no longer exists, for example because a drive is unplugged, the button opens at the nearest folder above it that still exists, or at the normal default, without showing an error. After each pick the app changes only that one line, so your own comments and edits stay as they are.
+
+The `[tools]` section is the same in all of these apps and says where to find outside programs. A value of `auto` looks next to the exe, then in each folder directly inside the exe's folder, then in a `bin` folder inside each of those, and then on the PATH. A value of `path` looks only on the PATH. Anything else is a path to the program; a relative path starts from the exe's folder, and variables such as `%USERPROFILE%` are filled in. If a path you typed does not exist, the app says which line is wrong instead of guessing. Photo Viewer uses the picture decoders built into Windows, so it needs no outside programs and this section is empty apart from comments. The `[photo-viewer]` section is for settings that only apply to this app and is empty for now.
+
+If the exe's folder cannot be written to, for example inside Program Files, the app uses `%APPDATA%\Photo Viewer\configuration.conf` instead. A `configuration.conf` next to the exe is still read first if it exists, and folders saved in the AppData copy are applied on top of it. If neither place can be written to, the app still works and remembers folders until it is closed.
+
 ## Run
 
 Start `Photo Viewer.exe`. Windows 10 or later. No extra files.
@@ -39,16 +49,6 @@ cargo test
 ```
 
 Tests decode `tests/fixtures/sample.jpg`.
-
-## Configuration file
-
-Photo Viewer keeps its settings in a plain text file called `configuration.conf` in the same folder as `Photo Viewer.exe`. If the file is missing, the app writes one with comments explaining every line the first time it starts. You can open it in Notepad and edit it while the app is closed. Lines that start with `#` are comments, `[name]` starts a section, and every setting is a `key = value` line. Key names are not case-sensitive, lines the app does not recognise are ignored, and deleting a line puts that setting back to its default.
-
-The `[folders]` section remembers where each Browse button last left off. `input` is the folder last picked with the Input folder button and `output` is the folder last picked with the Output folder button, for example `input = D:\Photos` and `output = E:\Picks`. Each button opens at its own remembered folder. If that folder no longer exists, for example because a drive is unplugged, the button opens at the nearest folder above it that still exists, or at the normal default, without showing an error. After each pick the app changes only that one line, so your own comments and edits stay as they are.
-
-The `[tools]` section is the same in all of these apps and says where to find outside programs. A value of `auto` looks next to the exe, then in each folder directly inside the exe's folder, then in a `bin` folder inside each of those, and then on the PATH. A value of `path` looks only on the PATH. Anything else is a path to the program; a relative path starts from the exe's folder, and variables such as `%USERPROFILE%` are filled in. If a path you typed does not exist, the app says which line is wrong instead of guessing. Photo Viewer uses the picture decoders built into Windows, so it needs no outside programs and this section is empty apart from comments. The `[photo-viewer]` section is for settings that only apply to this app and is empty for now.
-
-If the exe's folder cannot be written to, for example inside Program Files, the app uses `%APPDATA%\Photo Viewer\configuration.conf` instead. A `configuration.conf` next to the exe is still read first if it exists, and folders saved in the AppData copy are applied on top of it. If neither place can be written to, the app still works and remembers folders until it is closed.
 
 ## License
 
