@@ -459,13 +459,16 @@ fn browse(input: bool) {
         (app.hwnd, if input { app.input.clone() } else { app.output.clone() })
     });
     let title = if input { "Input folder" } else { "Output folder" };
-    let picked = pick_folder(hwnd, &current, title);
+    let key = if input { "input" } else { "output" };
+    let start = crate::config::picker_start(key).unwrap_or(current);
+    let picked = pick_folder(hwnd, &start, title);
     unsafe {
         let _ = SetFocus(hwnd);
     }
     let Some(path) = picked else {
         return;
     };
+    crate::config::remember_folder(key, &path);
     APP.with(|slot| {
         if let Some(app) = slot.borrow_mut().as_mut() {
             if input {
