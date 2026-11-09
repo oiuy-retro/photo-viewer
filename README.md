@@ -13,7 +13,7 @@ A built copy is [`Photo.Viewer.exe`](https://github.com/oiuy-retro/photo-viewer/
 - Wide pictures that do not fit across the window at fit height can be zoomed out further with the mouse wheel, down to fit width.
 - Thin name bar with the filename and a Folders button. Esc or Folders returns to Start without unloading the browsed paths.
 - EXIF / property pane (camera, dates, GPS, and the rest that WIC exposes).
-- Decoded BGRA stays in RAM around the current index; the whole folder if it fits. Decode uses a few worker threads.
+- Switching is meant to feel instant. Worker threads decode the next pictures in the direction you are moving (8 ahead, 3 behind) at the monitor's height, so the next picture is usually already in RAM and is just copied to the screen. The picture you jump to always goes first. Full resolution is decoded only when you zoom in past screen size.
 
 Formats are whatever WIC on that machine can open: JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, HEIC/HEIF (if the codecs are installed), JPEG XR, AVIF, and similar.
 
@@ -35,6 +35,32 @@ If the exe's folder cannot be written to, for example inside Program Files, the 
 
 Start `Photo Viewer.exe`. Windows 10 or later. No extra files.
 
+## Open pictures from Explorer
+
+`Photo Viewer.exe "C:\Photos\IMG_0001.jpg"` opens that picture and lets the arrow keys browse the rest of its folder, in the same name order. A folder path opens that folder. Each double-click opens its own window, like Windows Photo Viewer.
+
+Windows does not let the program set itself as the default. Put `Photo Viewer.exe` in a folder where it will stay, then run `scripts\set-default-viewer.ps1` once. It asks for that folder (or take `-Directory`) and makes Photo Viewer the current user's default for every picture type the program opens, including RAW. No administrator rights.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\set-default-viewer.ps1 -Directory "C:\Programs\Photo Viewer"
+```
+
+That remembers the previous default for each type in `%AppData%\Photo Viewer\default-viewer.json`. Put them back with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\undo-default-viewer.ps1
+```
+
+Settings, Apps, Default apps can change one type at a time. It has no single step that undoes every type the set script changed. If you move the exe, run the set script again with the new folder.
+
+To set one type by hand instead (once per type, for example .jpg, .png, .heic, .cr2):
+
+1. In Explorer, right-click a picture of that type, then Open with > Choose another app.
+2. Scroll down and pick More apps > Look for another app on this PC, and select `Photo Viewer.exe`.
+3. Tick "Always use this app to open .jpg files" (Windows 10) or choose Always (Windows 11).
+
+After the first time, Photo Viewer is listed under Open with for other types too.
+
 ## Build
 
 This crate targets `x86_64-pc-windows-gnu` (`rust-toolchain.toml`).
@@ -49,6 +75,8 @@ cargo test
 ```
 
 Tests decode `tests/fixtures/sample.jpg`.
+
+`cargo test --release -- --ignored --nocapture bench` with `PV_BENCH_DIR` set to a folder of large JPEGs prints decode and draw times. Run the app with `PV_TIMING=1` to log decode times and how long each switch took to `%TEMP%\photo-viewer-timing.log`.
 
 ## License
 
