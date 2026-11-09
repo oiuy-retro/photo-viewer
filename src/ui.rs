@@ -65,6 +65,8 @@ enum Hot {
     Close,
     InputBrowse,
     OutputBrowse,
+    MemoryLess,
+    MemoryMore,
     Open,
     Folders,
     Image,
@@ -107,6 +109,10 @@ struct Layout {
     output_label: RECT,
     output_box: RECT,
     output_browse: RECT,
+    memory_label: RECT,
+    memory_box: RECT,
+    memory_less: RECT,
+    memory_more: RECT,
     open: RECT,
     folders: RECT,
     name_bar: RECT,
@@ -183,6 +189,7 @@ struct App {
     screen: Screen,
     input: String,
     output: String,
+    memory_gb: u32,
     view: View,
     hot: Hot,
     press: Hot,
@@ -537,6 +544,7 @@ impl App {
             screen: Screen::Start,
             input: String::new(),
             output: String::new(),
+            memory_gb: 16,
             view: View::FitHeight,
             hot: Hot::None,
             press: Hot::None,
@@ -704,7 +712,7 @@ impl App {
 
         if self.screen == Screen::Start {
             let card_w = s(500);
-            let card_h = s(172);
+            let card_h = s(204);
             let cx = (inner.left + inner.right) / 2;
             let cy = (caption.bottom + inner.bottom) / 2;
             let card = RECT {
@@ -753,6 +761,32 @@ impl App {
                 right: input_box.right,
                 bottom: row2 + btn_h,
             };
+            let row3 = row2 + s(32);
+            let mem_btn = s(23);
+            let memory_more = RECT {
+                left: card.right - pad - mem_btn,
+                top: row3,
+                right: card.right - pad,
+                bottom: row3 + btn_h,
+            };
+            let memory_less = RECT {
+                left: memory_more.left - s(4) - mem_btn,
+                top: row3,
+                right: memory_more.left - s(4),
+                bottom: row3 + btn_h,
+            };
+            let memory_label = RECT {
+                left: input_label.left,
+                top: row3,
+                right: input_label.right,
+                bottom: row3 + btn_h,
+            };
+            let memory_box = RECT {
+                left: input_box.left,
+                top: row3,
+                right: memory_less.left - s(6),
+                bottom: row3 + btn_h,
+            };
             let open = RECT {
                 left: card.right - pad - btn_w,
                 top: card.bottom - pad - btn_h,
@@ -770,6 +804,10 @@ impl App {
                 output_label,
                 output_box,
                 output_browse,
+                memory_label,
+                memory_box,
+                memory_less,
+                memory_more,
                 open,
                 folders: nil,
                 name_bar: RECT {
@@ -844,6 +882,10 @@ impl App {
             output_label: nil,
             output_box: nil,
             output_browse: nil,
+            memory_label: nil,
+            memory_box: nil,
+            memory_less: nil,
+            memory_more: nil,
             open: nil,
             folders,
             name_bar,
@@ -913,6 +955,13 @@ impl App {
         self.notice.clear();
     }
 
+    fn step_memory(&mut self, dir: i32) {
+        let choices = photo::MEMORY_CHOICES_GB;
+        let index = choices.iter().position(|gb| *gb == self.memory_gb).unwrap_or(4);
+        let next = (index as i32 + dir).clamp(0, choices.len() as i32 - 1) as usize;
+        self.memory_gb = choices[next];
+    }
+
     fn set_output(&mut self, path: String) {
         self.output = path;
         self.notice.clear();
@@ -927,6 +976,7 @@ impl App {
         self.exif_scroll = 0;
         self.shown = None;
         self.notice.clear();
+        photo::set_memory_budget(photo::gb_bytes(self.memory_gb));
         self.lib.open_input(&self.hub, PathBuf::from(&self.input).as_path());
         if !self.output.is_empty() {
             self.lib.set_output(PathBuf::from(&self.output).as_path());
@@ -1001,6 +1051,10 @@ impl App {
                 Hot::InputBrowse
             } else if luna::hit(l.output_browse, p) {
                 Hot::OutputBrowse
+            } else if luna::hit(l.memory_less, p) {
+                Hot::MemoryLess
+            } else if luna::hit(l.memory_more, p) {
+                Hot::MemoryMore
             } else if luna::hit(l.open, p) {
                 Hot::Open
             } else if luna::hit(l.caption, p) {
@@ -1121,7 +1175,7 @@ impl App {
                     let _ = SetCapture(self.hwnd);
                 }
             }
-            Hot::Min | Hot::Max | Hot::Close | Hot::InputBrowse | Hot::OutputBrowse | Hot::Open | Hot::Folders => {
+            Hot::Min | Hot::Max | Hot::Close | Hot::InputBrowse | Hot::OutputBrowse | Hot::MemoryLess | Hot::MemoryMore | Hot::Open | Hot::Folders => {
                 self.redraw();
             }
             _ => {}
@@ -1156,6 +1210,16 @@ impl App {
             Hot::Max => Action::Max,
             Hot::InputBrowse => Action::BrowseInput,
             Hot::OutputBrowse => Action::BrowseOutput,
+            Hot::MemoryLess => {
+                self.step_memory(-1);
+                self.redraw();
+                Action::None
+            }
+            Hot::MemoryMore => {
+                self.step_memory(1);
+                self.redraw();
+                Action::None
+            }
             Hot::Open => Action::Open,
             Hot::Folders => {
                 self.back_to_start();
@@ -1616,6 +1680,26 @@ impl App {
             self.hot == Hot::OutputBrowse,
             self.press == Hot::OutputBrowse,
             true,
+        );
+        luna::text_left(hdc, self.fonts.tahoma8, l.memory_label, "Memory", luna::GROUP);
+        luna::edit_box(hdc, l.memory_box, &format!("{} GB", self.memory_gb), self.fonts.tahoma8, "");
+        luna::command_button(
+            hdc,
+            l.memory_less,
+            "-",
+            self.fonts.tahoma8,
+            self.hot == Hot::MemoryLess,
+            self.press == Hot::MemoryLess,
+            self.memory_gb > photo::MEMORY_CHOICES_GB[0],
+        );
+        luna::command_button(
+            hdc,
+            l.memory_more,
+            "+",
+            self.fonts.tahoma8,
+            self.hot == Hot::MemoryMore,
+            self.press == Hot::MemoryMore,
+            self.memory_gb < *photo::MEMORY_CHOICES_GB.last().unwrap_or(&64),
         );
         luna::command_button(
             hdc,

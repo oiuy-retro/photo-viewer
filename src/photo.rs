@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -29,7 +29,6 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
-use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::UI::Shell::PropertiesSystem::{
     IPropertyStore, PSFormatForDisplayAlloc, SHGetPropertyStoreFromParsingName, GPS_DEFAULT,
     PDFF_DEFAULT, PROPERTYKEY,
@@ -351,9 +350,10 @@ pub fn timing_log(line: &str) {
     }
 }
 
-/// How many pictures to keep decoded ahead of / behind the current one.
-const AHEAD: usize = 8;
-const BEHIND: usize = 3;
+/// The folder page offers these sizes. 16 GB is the default.
+pub const MEMORY_CHOICES_GB: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+static MEMORY_BUDGET: AtomicU64 = AtomicU64::new(16 * 1024 * 1024 * 1024);
 
 pub struct Library {
     pub gen: u64,
@@ -733,8 +733,9 @@ fn is_raw(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Current picture first, then the next few in the direction you are moving,
-/// with a couple behind in case you step back.
+/// Current picture first, then outward through the whole folder: two steps in
+/// the direction you are moving, then one behind, repeating. `kick` stops
+/// once the memory budget is full.
 fn priority(current: usize, n: usize, dir: i32) -> Vec<usize> {
     let step = |d: usize, forward: bool| -> Option<usize> {
         let ahead = (dir >= 0) == forward;
@@ -746,38 +747,35 @@ fn priority(current: usize, n: usize, dir: i32) -> Vec<usize> {
     };
     let mut out = vec![current];
     let (mut a, mut b) = (1, 1);
-    while a <= AHEAD || b <= BEHIND {
+    while out.len() < n {
+        let before = out.len();
         for _ in 0..2 {
-            if a <= AHEAD {
-                if let Some(i) = step(a, true) {
-                    out.push(i);
-                }
-                a += 1;
-            }
-        }
-        if b <= BEHIND {
-            if let Some(i) = step(b, false) {
+            if let Some(i) = step(a, true) {
                 out.push(i);
             }
-            b += 1;
+            a += 1;
+        }
+        if let Some(i) = step(b, false) {
+            out.push(i);
+        }
+        b += 1;
+        if out.len() == before {
+            break;
         }
     }
     out
 }
 
+pub fn gb_bytes(gb: u32) -> u64 {
+    (gb as u64) * 1024 * 1024 * 1024
+}
+
+pub fn set_memory_budget(bytes: u64) {
+    MEMORY_BUDGET.store(bytes.max(64 * 1024 * 1024), Ordering::Relaxed);
+}
+
 pub fn memory_budget() -> u64 {
-    unsafe {
-        let mut status = MEMORYSTATUSEX {
-            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-            ..Default::default()
-        };
-        if GlobalMemoryStatusEx(&mut status).is_err() {
-            return 512 * 1024 * 1024;
-        }
-        let from_avail = status.ullAvailPhys.saturating_sub(768 * 1024 * 1024);
-        let from_total = status.ullTotalPhys / 2;
-        from_avail.min(from_total).max(256 * 1024 * 1024)
-    }
+    MEMORY_BUDGET.load(Ordering::Relaxed)
 }
 
 pub fn format_bytes(n: u64) -> String {
@@ -1163,9 +1161,14 @@ mod tests {
     fn preloads_follow_direction() {
         assert_eq!(priority(5, 20, 1)[..6], [5, 6, 7, 4, 8, 9]);
         assert_eq!(priority(5, 20, -1)[..6], [5, 4, 3, 6, 2, 1]);
-        let all = priority(0, 3, 1);
-        assert_eq!(all, vec![0, 1, 2]);
-        assert!(priority(0, 1, -1) == vec![0]);
+        let mut forward = priority(5, 20, 1);
+        assert_eq!(forward.len(), 20);
+        forward.sort();
+        assert_eq!(forward, (0..20).collect::<Vec<_>>());
+        assert_eq!(priority(0, 3, 1), vec![0, 1, 2]);
+        assert_eq!(priority(0, 1, -1), vec![0]);
+        assert_eq!(gb_bytes(16), 16 * 1024 * 1024 * 1024);
+        assert_eq!(memory_budget(), gb_bytes(16));
     }
 
     #[test]
