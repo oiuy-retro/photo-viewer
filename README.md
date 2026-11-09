@@ -29,14 +29,27 @@ Start `Photo Viewer.exe`. Windows 10 or later. No extra files.
 
 `Photo Viewer.exe "C:\Photos\IMG_0001.jpg"` opens that picture and lets the arrow keys browse the rest of its folder, in the same name order. A folder path opens that folder. Each double-click opens its own window, like Windows Photo Viewer.
 
-To make it the default for a picture type (do this once per type, for example .jpg, .png, .heic, .cr2):
+Windows does not let the program set itself as the default. Put `Photo Viewer.exe` in a folder where it will stay, then run `scripts\set-default-viewer.ps1` once. It asks for that folder (or take `-Directory`) and makes Photo Viewer the current user's default for every picture type the program opens, including RAW. No administrator rights.
 
-1. Put `Photo Viewer.exe` where it will stay, for example `C:\Programs\Photo Viewer\`.
-2. In Explorer, right-click a picture of that type, then Open with > Choose another app.
-3. Scroll down and pick More apps > Look for another app on this PC, and select `Photo Viewer.exe`.
-4. Tick "Always use this app to open .jpg files" (Windows 10) or choose Always (Windows 11).
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\set-default-viewer.ps1 -Directory "C:\Programs\Photo Viewer"
+```
 
-Windows does not let an app make itself the default. After the first time, Photo Viewer is listed under Open with for other types too. If you move the exe, repeat these steps.
+That remembers the previous default for each type in `%AppData%\Photo Viewer\default-viewer.json`. Put them back with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\undo-default-viewer.ps1
+```
+
+Settings, Apps, Default apps can change one type at a time. It has no single step that undoes every type the set script changed. If you move the exe, run the set script again with the new folder.
+
+To set one type by hand instead (once per type, for example .jpg, .png, .heic, .cr2):
+
+1. In Explorer, right-click a picture of that type, then Open with > Choose another app.
+2. Scroll down and pick More apps > Look for another app on this PC, and select `Photo Viewer.exe`.
+3. Tick "Always use this app to open .jpg files" (Windows 10) or choose Always (Windows 11).
+
+After the first time, Photo Viewer is listed under Open with for other types too.
 
 ## Build
 
